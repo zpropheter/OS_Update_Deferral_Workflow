@@ -1,0 +1,122 @@
+#!/bin/sh
+#
+# gdmf_deferral_tracker.sh
+#
+# Apple Silicon only. Meant to run once per day (LaunchDaemon / Jamf policy).
+#
+# 1. Reads this Mac's GDMF "Device ID" (from IOPlatformExpertDevice ->
+#    IORegistryEntryName, e.g. J514cAP) - this is what GDMF's
+#    SupportedDevices arrays list for arm64 hardware, NOT hw.model.
+# 2. Pulls https://gdmf.apple.com/v2/pmv and finds every macOS release
+#    whose SupportedDevices includes this Mac's Device ID.
+# 3. For each match, computes days since PostingDate (Apple's release
+#    date for that build). Because PostingDate never changes, this is
+#    recalculated fresh each run - no state file needed for the counter
+#    to be accurate day over day.
+# 4. Writes a JSON summary: every release within the deferral window,
+#    plus the single most recent release that has just aged OUT of the
+#    window (i.e. the newest update your deferral policy can no longer
+#    hold back) - that's the version to scope your "force update" group to.
+#
+# Override the deferral window per-run:
+#   DEFERRAL_LIMIT_DAYS=60 ./gdmf_deferral_tracker.sh
+#
+# Override output path per-run:
+#   OUTPUT_FILE=/tmp/test.json ./gdmf_deferral_tracker.sh
+
+set -eu
+
+DEFERRAL_LIMIT_DAYS="${DEFERRAL_LIMIT_DAYS:-90}"
+OUTPUT_FILE="${OUTPUT_FILE:-/var/log/gdmf_deferral_status.json}"
+ASSET_SET="${ASSET_SET:-AssetSets}"   # AssetSets = full release history; PublicAssetSets = latest per major only
+GDMF_URL="https://gdmf.apple.com/v2/pmv"
+
+# ---- Guard: Apple Silicon only ----
+if [ "$(arch)" != "arm64" ]; then
+	echo "gdmf_deferral_tracker.sh only supports Apple Silicon. Exiting." >&2
+	exit 1
+fi
+
+# ---- This Mac's GDMF device identifier ----
+deviceID=$(ioreg -arc IOPlatformExpertDevice -d 1 | plutil -extract 0.IORegistryEntryName raw -o - -)
+if [ -z "$deviceID" ]; then
+	echo "Could not determine Device ID." >&2
+	exit 1
+fi
+
+# ---- Currently installed OS, used to ignore stale major-version tracks ----
+# GDMF keeps SupportedDevices entries for old majors (14.x, 15.x, ...) alive
+# indefinitely for any hardware that's capable of running them, even after a
+# given Mac has already moved on to a newer major. Without this filter, a
+# device already on macOS 26 would get compared against an ancient, long-
+# expired 15.x deferral clock that's no longer relevant to it.
+currentVersion=$(sw_vers -productVersion)
+currentMajor=$(printf '%s' "$currentVersion" | cut -d. -f1)
+
+# ---- Fetch GDMF feed to a real temp file ----
+# (plutil against a literal "/dev/stdin" heredoc trips a permissions error
+# under sudo - "stdin couldn't be opened because you don't have permission
+# to view it" - so we write to disk once and point plutil at that file.)
+tmpJSON=$(mktemp /tmp/gdmf.XXXXXX.plist)
+trap 'rm -f "$tmpJSON"' EXIT
+
+curl -sf "$GDMF_URL" -o "$tmpJSON" || { echo "Failed to fetch GDMF feed at ${GDMF_URL}" >&2; exit 1; }
+
+count=$(plutil -extract "${ASSET_SET}.macOS" raw -o - "$tmpJSON")
+
+nowEpoch=$(date -u +%s)
+
+recentEntries=""
+recentCount=0
+mostRecentExpired="null"
+mostRecentExpiredDays=999999
+recommendedScopeVersion="null"
+
+i=0
+while [ "$i" -lt "$count" ]; do
+	supported=$(plutil -extract "${ASSET_SET}.macOS.${i}.SupportedDevices" json -o - "$tmpJSON")
+
+	if printf '%s' "$supported" | grep -q "\"${deviceID}\""; then
+		version=$(plutil -extract "${ASSET_SET}.macOS.${i}.ProductVersion" raw -o - "$tmpJSON")
+		versionMajor=$(printf '%s' "$version" | cut -d. -f1)
+
+		# Ignore tracks older than the major version currently installed.
+		if [ "$versionMajor" -ge "$currentMajor" ]; then
+			build=$(plutil -extract "${ASSET_SET}.macOS.${i}.Build" raw -o - "$tmpJSON")
+			postingDate=$(plutil -extract "${ASSET_SET}.macOS.${i}.PostingDate" raw -o - "$tmpJSON")
+
+			# PostingDate is "YYYY-MM-DD"
+			postEpoch=$(date -u -j -f "%Y-%m-%d" "$postingDate" +%s 2>/dev/null) || postEpoch=""
+			if [ -n "$postEpoch" ]; then
+				daysSince=$(( (nowEpoch - postEpoch) / 86400 ))
+
+				if [ "$daysSince" -le "$DEFERRAL_LIMIT_DAYS" ]; then
+					[ "$recentCount" -gt 0 ] && recentEntries="${recentEntries},"
+					recentEntries="${recentEntries}
+    {\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}}"
+					recentCount=$((recentCount + 1))
+				elif [ "$daysSince" -lt "$mostRecentExpiredDays" ]; then
+					mostRecentExpiredDays=$daysSince
+					mostRecentExpired="{\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}}"
+					recommendedScopeVersion="\"${version}\""
+				fi
+			fi
+		fi
+	fi
+	i=$((i + 1))
+done
+
+cat > "$OUTPUT_FILE" <<JSON
+{
+  "deviceID": "${deviceID}",
+  "currentVersion": "${currentVersion}",
+  "checkedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "deferralLimitDays": ${DEFERRAL_LIMIT_DAYS},
+  "updatesWithinDeferralWindow": [${recentEntries}
+  ],
+  "mostRecentlyExpiredDeferral": ${mostRecentExpired},
+  "recommendedScopeVersion": ${recommendedScopeVersion}
+}
+JSON
+
+cat "$OUTPUT_FILE"
