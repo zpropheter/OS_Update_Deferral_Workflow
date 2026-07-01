@@ -13,10 +13,11 @@
 #    date for that build). Because PostingDate never changes, this is
 #    recalculated fresh each run - no state file needed for the counter
 #    to be accurate day over day.
-# 4. Writes a JSON summary: every release within the deferral window,
-#    plus the single most recent release that has just aged OUT of the
-#    window (i.e. the newest update your deferral policy can no longer
-#    hold back) - that's the version to scope your "force update" group to.
+# 4. Writes a JSON summary: every release within the deferral window
+#    (sorted most days-since-release to least, for easy table reference),
+#    plus "nextUpdateDue" - the newest release that has just aged OUT of
+#    the window (i.e. the update your deferral policy can no longer hold
+#    back) - that's the version to scope your "force update" group to.
 #
 # Override the deferral window per-run:
 #   DEFERRAL_LIMIT_DAYS=60 ./gdmf_deferral_tracker.sh
@@ -66,10 +67,11 @@ count=$(plutil -extract "${ASSET_SET}.macOS" raw -o - "$tmpJSON")
 
 nowEpoch=$(date -u +%s)
 
-recentEntries=""
-recentCount=0
-mostRecentExpired="null"
-mostRecentExpiredDays=999999
+# Each qualifying entry gets buffered as "<daysSince>\t<jsonObject>" so it
+# can be sorted numerically by daysSince before being written out.
+recentList=""
+nextUpdateDue="null"
+nextUpdateDueDays=999999
 recommendedScopeVersion="null"
 
 i=0
@@ -91,13 +93,11 @@ while [ "$i" -lt "$count" ]; do
 				daysSince=$(( (nowEpoch - postEpoch) / 86400 ))
 
 				if [ "$daysSince" -le "$DEFERRAL_LIMIT_DAYS" ]; then
-					[ "$recentCount" -gt 0 ] && recentEntries="${recentEntries},"
-					recentEntries="${recentEntries}
-    {\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}}"
-					recentCount=$((recentCount + 1))
-				elif [ "$daysSince" -lt "$mostRecentExpiredDays" ]; then
-					mostRecentExpiredDays=$daysSince
-					mostRecentExpired="{\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}}"
+					recentList="${recentList}${daysSince}	{\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}}
+"
+				elif [ "$daysSince" -lt "$nextUpdateDueDays" ]; then
+					nextUpdateDueDays=$daysSince
+					nextUpdateDue="{\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}}"
 					recommendedScopeVersion="\"${version}\""
 				fi
 			fi
@@ -105,6 +105,27 @@ while [ "$i" -lt "$count" ]; do
 	fi
 	i=$((i + 1))
 done
+
+# ---- Sort the deferral-window list by daysSinceRelease, most to least ----
+recentEntries=""
+first=1
+if [ -n "$recentList" ]; then
+	sortedRecent=$(printf '%s' "$recentList" | sort -t "$(printf '\t')" -k1,1 -nr)
+	while IFS= read -r line; do
+		[ -z "$line" ] && continue
+		jsonPart=$(printf '%s\n' "$line" | cut -f2-)
+		if [ "$first" -eq 1 ]; then
+			recentEntries="
+    ${jsonPart}"
+			first=0
+		else
+			recentEntries="${recentEntries},
+    ${jsonPart}"
+		fi
+	done <<SORTED
+${sortedRecent}
+SORTED
+fi
 
 cat > "$OUTPUT_FILE" <<JSON
 {
@@ -114,7 +135,7 @@ cat > "$OUTPUT_FILE" <<JSON
   "deferralLimitDays": ${DEFERRAL_LIMIT_DAYS},
   "updatesWithinDeferralWindow": [${recentEntries}
   ],
-  "mostRecentlyExpiredDeferral": ${mostRecentExpired},
+  "nextUpdateDue": ${nextUpdateDue},
   "recommendedScopeVersion": ${recommendedScopeVersion}
 }
 JSON
