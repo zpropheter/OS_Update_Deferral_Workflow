@@ -45,14 +45,35 @@ if [ -z "$deviceID" ]; then
 	exit 1
 fi
 
-# ---- Currently installed OS, used to ignore stale major-version tracks ----
-# GDMF keeps SupportedDevices entries for old majors (14.x, 15.x, ...) alive
-# indefinitely for any hardware that's capable of running them, even after a
-# given Mac has already moved on to a newer major. Without this filter, a
-# device already on macOS 26 would get compared against an ancient, long-
-# expired 15.x deferral clock that's no longer relevant to it.
+# ---- Currently installed OS, used to ignore stale/already-installed tracks ----
+# GDMF keeps SupportedDevices entries alive for every release the hardware
+# is capable of running, including old majors (14.x, 15.x, ...) and the
+# exact version already installed. None of that is a pending update, so we
+# only consider GDMF entries whose version is strictly newer than what's
+# currently installed - a proper numeric compare, not a string compare
+# (26.5.10 must sort after 26.5.2, string comparison would get that wrong).
 currentVersion=$(sw_vers -productVersion)
-currentMajor=$(printf '%s' "$currentVersion" | cut -d. -f1)
+
+# Returns 0 (true) if $1 is a newer version than $2, comparing up to 4
+# dot-separated numeric segments; missing segments are treated as 0.
+version_gt() {
+	n=1
+	while [ "$n" -le 4 ]; do
+		f1=$(printf '%s' "$1" | cut -d. -f"$n")
+		f2=$(printf '%s' "$2" | cut -d. -f"$n")
+		f1=${f1:-0}
+		f2=${f2:-0}
+		case "$f1" in ''|*[!0-9]*) f1=0 ;; esac
+		case "$f2" in ''|*[!0-9]*) f2=0 ;; esac
+		if [ "$f1" -gt "$f2" ]; then
+			return 0
+		elif [ "$f1" -lt "$f2" ]; then
+			return 1
+		fi
+		n=$((n + 1))
+	done
+	return 1
+}
 
 # ---- Fetch GDMF feed to a real temp file ----
 # (plutil against a literal "/dev/stdin" heredoc trips a permissions error
@@ -80,10 +101,10 @@ while [ "$i" -lt "$count" ]; do
 
 	if printf '%s' "$supported" | grep -q "\"${deviceID}\""; then
 		version=$(plutil -extract "${ASSET_SET}.macOS.${i}.ProductVersion" raw -o - "$tmpJSON")
-		versionMajor=$(printf '%s' "$version" | cut -d. -f1)
 
-		# Ignore tracks older than the major version currently installed.
-		if [ "$versionMajor" -ge "$currentMajor" ]; then
+		# Only consider versions actually newer than what's installed - this
+		# is not a pending update otherwise, regardless of its posting date.
+		if version_gt "$version" "$currentVersion"; then
 			build=$(plutil -extract "${ASSET_SET}.macOS.${i}.Build" raw -o - "$tmpJSON")
 			postingDate=$(plutil -extract "${ASSET_SET}.macOS.${i}.PostingDate" raw -o - "$tmpJSON")
 
