@@ -1,5 +1,40 @@
 #!/bin/sh
 #
+# install_gdmf_deferral_workflow.sh
+#
+# Fully self-contained installer - no other files to package or upload.
+# Writes out the worker script (gdmf_deferral_tracker.sh) and the
+# LaunchDaemon plist that runs it, then loads the daemon immediately.
+# Deploy this single script (e.g. as one Jamf policy) and it does
+# everything else on the target Mac. Run as root (sudo, or a Jamf
+# policy, which already executes as root).
+#
+# Result once loaded:
+#   - Runs immediately (RunAtLoad)
+#   - Runs again on every subsequent restart
+#   - Runs daily at 12:00 PM local time (StartCalendarInterval)
+#
+# Override the deferral window or output path by editing the
+# EnvironmentVariables block in the embedded plist below, then re-run
+# this installer (it safely reloads if already installed).
+
+set -eu
+
+LABEL="com.updatedeferral.workflow"
+SCRIPT_DEST="/usr/local/bin/gdmf_deferral_tracker.sh"
+PLIST_DEST="/Library/LaunchDaemons/${LABEL}.plist"
+
+if [ "$(id -u)" -ne 0 ]; then
+	echo "Must be run as root (sudo)." >&2
+	exit 1
+fi
+
+mkdir -p /usr/local/bin
+
+# ---- Write the worker script ----
+cat > "$SCRIPT_DEST" <<'WORKER_SCRIPT'
+#!/bin/sh
+#
 # gdmf_deferral_tracker.sh
 #
 # Apple Silicon only. Meant to run once per day (LaunchDaemon / Jamf policy).
@@ -15,9 +50,12 @@
 #    to be accurate day over day.
 # 4. Writes a JSON summary: every release within the deferral window
 #    (sorted most days-since-release to least, for easy table reference),
-#    plus "nextUpdateDue" - the newest release that has just aged OUT of
-#    the window (i.e. the update your deferral policy can no longer hold
-#    back) - that's the version to scope your "force update" group to.
+#    plus "nextMinorUpdateDue" and "nextMajorUpdateDue" - the newest same-
+#    major and newest different-major release (respectively) that have
+#    just aged OUT of the window, i.e. the updates your deferral policy
+#    can no longer hold back. Kept separate because a minor update (e.g.
+#    15.7.6) and a major upgrade (e.g. 26.0) are scoped to very different
+#    Smart Groups/policies and shouldn't be collapsed into one value.
 #
 # Override the deferral window per-run:
 #   DEFERRAL_LIMIT_DAYS=60 ./gdmf_deferral_tracker.sh
@@ -27,7 +65,7 @@
 
 set -eu
 
-DEFERRAL_LIMIT_DAYS="${DEFERRAL_LIMIT_DAYS:-90}"
+DEFERRAL_LIMIT_DAYS="${DEFERRAL_LIMIT_DAYS:-7}"
 OUTPUT_FILE="${OUTPUT_FILE:-/var/log/gdmf_deferral_status.json}"
 ASSET_SET="${ASSET_SET:-AssetSets}"   # AssetSets = full release history; PublicAssetSets = latest per major only
 GDMF_URL="https://gdmf.apple.com/v2/pmv"
@@ -53,6 +91,7 @@ fi
 # currently installed - a proper numeric compare, not a string compare
 # (26.5.10 must sort after 26.5.2, string comparison would get that wrong).
 currentVersion=$(sw_vers -productVersion)
+currentMajor=$(printf '%s' "$currentVersion" | cut -d. -f1)
 
 # Returns 0 (true) if $1 is a newer version than $2, comparing up to 4
 # dot-separated numeric segments; missing segments are treated as 0.
@@ -91,8 +130,12 @@ nowEpoch=$(date -u +%s)
 # Each qualifying entry gets buffered as "<daysSince>\t<jsonObject>" so it
 # can be sorted numerically by daysSince before being written out.
 recentList=""
-nextUpdateDue="null"
-nextUpdateDueDays=999999
+nextMinorUpdateDue="null"
+nextMinorUpdateDueDays=999999
+nextMinorUpdateDueVersion=""
+nextMajorUpdateDue="null"
+nextMajorUpdateDueDays=999999
+nextMajorUpdateDueVersion=""
 recommendedScopeVersion="null"
 
 i=0
@@ -105,6 +148,13 @@ while [ "$i" -lt "$count" ]; do
 		# Only consider versions actually newer than what's installed - this
 		# is not a pending update otherwise, regardless of its posting date.
 		if version_gt "$version" "$currentVersion"; then
+			versionMajor=$(printf '%s' "$version" | cut -d. -f1)
+			if [ "$versionMajor" = "$currentMajor" ]; then
+				updateType="minor"
+			else
+				updateType="major"
+			fi
+
 			build=$(plutil -extract "${ASSET_SET}.macOS.${i}.Build" raw -o - "$tmpJSON")
 			postingDate=$(plutil -extract "${ASSET_SET}.macOS.${i}.PostingDate" raw -o - "$tmpJSON")
 
@@ -114,18 +164,30 @@ while [ "$i" -lt "$count" ]; do
 				daysSince=$(( (nowEpoch - postEpoch) / 86400 ))
 
 				if [ "$daysSince" -le "$DEFERRAL_LIMIT_DAYS" ]; then
-					recentList="${recentList}${daysSince}	{\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}}
+					recentList="${recentList}${daysSince}	{\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}, \"type\": \"${updateType}\"}
 "
-				elif [ "$daysSince" -lt "$nextUpdateDueDays" ]; then
-					nextUpdateDueDays=$daysSince
-					nextUpdateDue="{\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}}"
-					recommendedScopeVersion="\"${version}\""
+				elif [ "$updateType" = "minor" ] && [ "$daysSince" -lt "$nextMinorUpdateDueDays" ]; then
+					nextMinorUpdateDueDays=$daysSince
+					nextMinorUpdateDue="{\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}}"
+					nextMinorUpdateDueVersion="$version"
+				elif [ "$updateType" = "major" ] && [ "$daysSince" -lt "$nextMajorUpdateDueDays" ]; then
+					nextMajorUpdateDueDays=$daysSince
+					nextMajorUpdateDue="{\"version\": \"${version}\", \"build\": \"${build}\", \"postingDate\": \"${postingDate}\", \"daysSinceRelease\": ${daysSince}}"
+					nextMajorUpdateDueVersion="$version"
 				fi
 			fi
 		fi
 	fi
 	i=$((i + 1))
 done
+
+# Prefer flagging the minor update, since that's what's normally scoped for
+# a forced install; fall back to the major upgrade if no minor is overdue.
+if [ -n "$nextMinorUpdateDueVersion" ]; then
+	recommendedScopeVersion="\"${nextMinorUpdateDueVersion}\""
+elif [ -n "$nextMajorUpdateDueVersion" ]; then
+	recommendedScopeVersion="\"${nextMajorUpdateDueVersion}\""
+fi
 
 # ---- Sort the deferral-window list by daysSinceRelease, most to least ----
 recentEntries=""
@@ -156,9 +218,67 @@ cat > "$OUTPUT_FILE" <<JSON
   "deferralLimitDays": ${DEFERRAL_LIMIT_DAYS},
   "updatesWithinDeferralWindow": [${recentEntries}
   ],
-  "nextUpdateDue": ${nextUpdateDue},
+  "nextMinorUpdateDue": ${nextMinorUpdateDue},
+  "nextMajorUpdateDue": ${nextMajorUpdateDue},
   "recommendedScopeVersion": ${recommendedScopeVersion}
 }
 JSON
 
 cat "$OUTPUT_FILE"
+WORKER_SCRIPT
+
+chown root:wheel "$SCRIPT_DEST"
+chmod 755 "$SCRIPT_DEST"
+
+# ---- Write the LaunchDaemon plist ----
+cat > "$PLIST_DEST" <<PLIST_FILE
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${LABEL}</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>${SCRIPT_DEST}</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>12</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>DEFERRAL_LIMIT_DAYS</key>
+		<string>7</string>
+		<key>OUTPUT_FILE</key>
+		<string>/var/log/gdmf_deferral_status.json</string>
+	</dict>
+
+	<key>StandardOutPath</key>
+	<string>/var/log/gdmf_deferral_tracker.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/gdmf_deferral_tracker.log</string>
+</dict>
+</plist>
+PLIST_FILE
+
+chown root:wheel "$PLIST_DEST"
+chmod 644 "$PLIST_DEST"
+
+# ---- Load (or reload) the daemon ----
+if launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+	launchctl bootout system "$PLIST_DEST" 2>/dev/null || true
+fi
+launchctl bootstrap system "$PLIST_DEST"
+
+echo "Installed ${SCRIPT_DEST} and loaded ${LABEL}."
+echo "Runs now (RunAtLoad), daily at 12:00 PM, and on every restart."
