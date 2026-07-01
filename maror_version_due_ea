@@ -1,0 +1,31 @@
+#!/bin/sh
+#
+# gdmf_overdue_major_update_ea.sh
+# Jamf Pro Extension Attribute (data type: String)
+#
+# Reads the JSON written by gdmf_deferral_tracker.sh and reports the
+# "nextMajorUpdateDue" version - a newer-major macOS release (e.g. 26.0
+# while this Mac is still on 15.x) whose deferral window has expired and
+# that this Mac still hasn't been forced to upgrade to. Returns "None" if
+# no newer-major upgrade has aged out of the deferral window.
+#
+# See gdmf_overdue_minor_update_ea.sh for the same-major-version
+# equivalent (e.g. flagging 15.7.7 while on 15.7.5).
+#
+# Optional override (e.g. Jamf policy parameter):
+#   ./gdmf_overdue_major_update_ea.sh /custom/path/to/status.json
+
+statusFile="${1:-/var/log/gdmf_deferral_status.json}"
+
+if [ ! -f "$statusFile" ]; then
+	echo "<result>Unknown - status file not found</result>"
+	exit 0
+fi
+
+version=$(plutil -extract nextMajorUpdateDue.version raw -o - "$statusFile" 2>/dev/null)
+
+if [ -z "$version" ] || [ "$version" = "null" ]; then
+	echo "<result>None</result>"
+else
+	echo "<result>${version}</result>"
+fi
