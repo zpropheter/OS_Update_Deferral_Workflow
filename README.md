@@ -1,5 +1,5 @@
 # Deferral Auto Update Workflow
-
+![Software Update Settings]([https://imgur.com](https://imgur.com/02wvOhS))
 ## Requirements
 - Jamf Pro
 - Blueprints
