@@ -13,9 +13,15 @@
 #   - Runs immediately (RunAtLoad)
 #   - Runs again on every subsequent restart
 #   - Runs daily at 12:00 PM local time (StartCalendarInterval)
+#   - On any run where nextMinorUpdateDue/nextMajorUpdateDue changed since
+#     the last run, calls "jamf policy -event <trigger>" so a Jamf Pro
+#     policy can react (force install, notify user, etc). Set up policies
+#     in Jamf Pro with custom triggers "gdmfMinorUpdateDue" and
+#     "gdmfMajorUpdateDue" (or override the trigger names below) scoped
+#     to however you want minor updates vs major upgrades handled.
 #
-# Override the deferral window or output path by editing the
-# EnvironmentVariables block in the embedded plist below, then re-run
+# Override the deferral window, output path, or Jamf triggers by editing
+# the EnvironmentVariables block in the embedded plist below, then re-run
 # this installer (it safely reloads if already installed).
 
 set -eu
@@ -57,18 +63,45 @@ cat > "$SCRIPT_DEST" <<'WORKER_SCRIPT'
 #    15.7.6) and a major upgrade (e.g. 26.0) are scoped to very different
 #    Smart Groups/policies and shouldn't be collapsed into one value.
 #
+# 5. Compares nextMinorUpdateDue/nextMajorUpdateDue against the value
+#    from the previous run (persisted in STATE_FILE). If either value
+#    changed - including going from "nothing due" to "something due", or
+#    from one overdue version to a newer one - it calls out to Jamf Pro
+#    via a custom trigger (`jamf policy -event <trigger>`) so a policy can
+#    react (e.g. force the install, notify the user, etc). Because this
+#    runs on every boot (RunAtLoad) as well as daily at noon, a value that
+#    changed while the Mac was off gets caught and reported the moment it
+#    powers back on, not just at the next scheduled noon run.
+#
 # Override the deferral window per-run:
 #   DEFERRAL_LIMIT_DAYS=60 ./gdmf_deferral_tracker.sh
 #
 # Override output path per-run:
 #   OUTPUT_FILE=/tmp/test.json ./gdmf_deferral_tracker.sh
+#
+# Override the Jamf custom triggers / state file per-run:
+#   JAMF_MINOR_TRIGGER=myMinorTrigger JAMF_MAJOR_TRIGGER=myMajorTrigger ./gdmf_deferral_tracker.sh
 
 set -eu
 
-DEFERRAL_LIMIT_DAYS="${DEFERRAL_LIMIT_DAYS:-7}"
+DEFERRAL_LIMIT_DAYS="${DEFERRAL_LIMIT_DAYS:-90}"
 OUTPUT_FILE="${OUTPUT_FILE:-/var/log/gdmf_deferral_status.json}"
 ASSET_SET="${ASSET_SET:-AssetSets}"   # AssetSets = full release history; PublicAssetSets = latest per major only
 GDMF_URL="https://gdmf.apple.com/v2/pmv"
+
+# ---- Jamf Pro notification settings ----
+JAMF_BIN="${JAMF_BIN:-/usr/local/bin/jamf}"
+JAMF_MINOR_TRIGGER="${JAMF_MINOR_TRIGGER:-gdmfMinorUpdateDue}"
+JAMF_MAJOR_TRIGGER="${JAMF_MAJOR_TRIGGER:-gdmfMajorUpdateDue}"
+STATE_FILE="${STATE_FILE:-/var/log/gdmf_deferral_state.txt}"
+
+# ---- Load the previous run's overdue versions, if any, for comparison ----
+prevMinor=""
+prevMajor=""
+if [ -f "$STATE_FILE" ]; then
+	prevMinor=$(awk -F= '$1 == "minor" { print $2 }' "$STATE_FILE")
+	prevMajor=$(awk -F= '$1 == "major" { print $2 }' "$STATE_FILE")
+fi
 
 # ---- Guard: Apple Silicon only ----
 if [ "$(arch)" != "arm64" ]; then
@@ -189,6 +222,30 @@ elif [ -n "$nextMajorUpdateDueVersion" ]; then
 	recommendedScopeVersion="\"${nextMajorUpdateDueVersion}\""
 fi
 
+# ---- Notify Jamf Pro if the overdue version changed since last run ----
+# Fires on: nothing-due -> due, due -> a newer due version, or due -> clear.
+notify_jamf() {
+	trigger="$1"
+	if [ -x "$JAMF_BIN" ]; then
+		"$JAMF_BIN" policy -event "$trigger"
+	else
+		echo "jamf binary not found at ${JAMF_BIN}; skipping -event ${trigger}" >&2
+	fi
+}
+
+if [ "$nextMinorUpdateDueVersion" != "$prevMinor" ]; then
+	notify_jamf "$JAMF_MINOR_TRIGGER"
+fi
+if [ "$nextMajorUpdateDueVersion" != "$prevMajor" ]; then
+	notify_jamf "$JAMF_MAJOR_TRIGGER"
+fi
+
+# ---- Persist this run's values so the next run can detect a change ----
+{
+	echo "minor=${nextMinorUpdateDueVersion}"
+	echo "major=${nextMajorUpdateDueVersion}"
+} > "$STATE_FILE"
+
 # ---- Sort the deferral-window list by daysSinceRelease, most to least ----
 recentEntries=""
 first=1
@@ -258,9 +315,17 @@ cat > "$PLIST_DEST" <<PLIST_FILE
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>DEFERRAL_LIMIT_DAYS</key>
-		<string>7</string>
+		<string>90</string>
 		<key>OUTPUT_FILE</key>
 		<string>/var/log/gdmf_deferral_status.json</string>
+		<key>STATE_FILE</key>
+		<string>/var/log/gdmf_deferral_state.txt</string>
+		<key>JAMF_BIN</key>
+		<string>/usr/local/bin/jamf</string>
+		<key>JAMF_MINOR_TRIGGER</key>
+		<string>gdmfMinorUpdateDue</string>
+		<key>JAMF_MAJOR_TRIGGER</key>
+		<string>gdmfMajorUpdateDue</string>
 	</dict>
 
 	<key>StandardOutPath</key>
