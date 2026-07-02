@@ -1,5 +1,9 @@
 # Deferral Auto Update Workflow
 
+This is a workflow designed to allow admins who need to defer updates for a period while also utilizing the "set and forget" update feature with Jamf Pro blueprints. It is still a work in progress, so please open an issue if you notice anything. I have some code in here for Major OS Update deferrals but for right now I'm focused on the minor part. The workflow is a bit tricky so be sure to follow each step carefully.
+
+The install_LD_policy only needs to run once, loads a LaunchDaemon that checks deferrals according to the lines in the script noted in the setup and drops the devices into the auto update queue as the devices pass the deferral window. Once an update is installed, it re-evaluates deferrals on reboot and if none are past the window, submits an inventory update, drops it out of the group for the Auto Update blueprint and back into the deferral blueprint. Otherwise the evaluation runs once per day and a subsequent inventory update during that day will update the values. 
+
 ## Requirements
 - Jamf Pro
 - Blueprints
@@ -47,7 +51,17 @@
     - Apple releases 26.6 and the 7 day timer starts
     - Before the deferral ends, Apple releases 26.7
     - The macBook falls into the blueprint for `Latest OS Update` and sees that 26.6 and 26.7 are available. With your 10 day requirement in the blueprint, this gives 3 days after the deferral to install 26.6 and 13 days for 26.7, both of which are queued for install
-    - 26.6 enforces first and the user installs. At the next checkin, the device checks the EA again and sees that 26.7 is still within the deferral window and falls out of the blueprint group for `Latest OS Update` and back into the 7 day deferral blueprint which is now enforced. 
+    - 26.6 enforces first and the user installs. At the next checkin, the device checks the EA again and sees that 26.7 is still within the deferral window and falls out of the blueprint group for `Latest OS Update` and back into the 7 day deferral blueprint which is now enforced.
+ 
+# Policy
+- In an attempt to prevent stale data a workflow has been created to address the caveat listed in the next section, please follow instructions carefully to mitigate any server performance issues
+- Create a Policy in Jamf Pro
+-     Set the trigger to custom and use `gdmfMinorUpdateDue` as the trigger name
+-     Frequency is once per day
+-     Scope to your `install deferred updates group` created in the Smart Group Section in Step 2
+- Add a maintenance payload and include the option to update inventory.
+
+- When a device updates, the daemon compares the last value to current value, if there's still an existing update that's past the deferral window, the device will remain in the `Latest OS Update` enforcement and queue the subsequent update. Otherwise, it will flip the value to "None" which removes the device from the smart group and sets it back in the deferral group.
 
 # Caveats
 - The LaunchDaemon is set to run once a day and after a reboot to keep the values updated after an OS Update Event. 
