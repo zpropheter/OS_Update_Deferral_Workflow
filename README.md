@@ -31,7 +31,8 @@
 2. Create a blueprint with Software Updates Payload
     1. Configure the blueprint to use the following settings
         1. Enforcement Type: Latest OS Version
-        2. In Days after release to enforce update include the number of days in the deferral and add that to how many days you want to allow the user to install the update. For example, if you defer updates for 7 days and want users to have 3 days to install the update, this value should be 10 (max value is 30 as of 7/1/2026)
+        2. Check the box to "Ignore Major Versions"
+        3. In Days after release to enforce update include the number of days in the deferral and add that to how many days you want to allow the user to install the update. For example, if you defer updates for 7 days and want users to have 3 days to install the update, this value should be 10 (max value is 30 as of 7/1/2026)
     2. Scope the blueprint to the Smart group created in Step 2 of Smart Group Setup.
 
 # Workflow
