@@ -1,5 +1,5 @@
 # Deferral Auto Update Workflow
-![Software Update Settings]([https://imgur.com/02wvOhS](https://imgur.com/02wvOhS))
+
 ## Requirements
 - Jamf Pro
 - Blueprints
@@ -19,21 +19,26 @@
     1. Minor Deferral Due is ______
     2. or
     3. Minor Deferral due is None
+![Updates Deferred](https://i.imgur.com/hh8RkCC.png)
+
 2. Create a smart group for enforcing updates with the following criteria
     1. Minor Deferral Due is not ______
     2. and
     3. Minor Deferral due is not None
+![Install Deferred Updates](https://i.imgur.com/cntfiYP.png)
 
 ## Blueprints
 1. Create a blueprint with Software Update Settings Payload
     1. Set the deferral in the blueprint to match the days set in Step 2 of the Script and EA Setup section.
     2. Scope the blueprint to the Smart group created in Step 1 of Smart Group Setup.
+![Software Update Settings Payload](https://i.imgur.com/bHdDDmq.png)
 2. Create a blueprint with Software Updates Payload
     1. Configure the blueprint to use the following settings
         1. Enforcement Type: Latest OS Version
         2. Check the box to "Ignore Major Versions"
         3. In Days after release to enforce update include the number of days in the deferral and add that to how many days you want to allow the user to install the update. For example, if you defer updates for 7 days and want users to have 3 days to install the update, this value should be 10 (max value is 30 as of 7/1/2026)
     2. Scope the blueprint to the Smart group created in Step 2 of Smart Group Setup.
+![Software Updates Payload](https://imgur.com/02wvOhS.png))
 
 # Workflow
 - By default, devices will fall into the deferred updates section to prevent unintentional updates. As the devices report in, they will update the values and either remain in the deferral group if they're up to date, or fall into the auto update blueprint if they have an OS Update beyond the deferred range
